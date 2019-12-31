@@ -10,6 +10,98 @@ import threading
 import datetime
 import queue
 
+
+def conv_op(input_op, name, kw, kh, n_out, dw, dh, wd, padding='SAME', activation=True):
+    n_in = input_op.get_shape()[-1].value
+    shape = [kh, kw, n_in, n_out]
+    with tensorflow.variable_scope(name):
+        # kernel = _variable_with_weight_decay('w', shape, dw)
+        receptive_field_size = numpy.prod(shape[:-2])
+        fan_in = shape[-2] * receptive_field_size
+        fan_out = shape[-1] * receptive_field_size
+        init_range = numpy.sqrt(6.0 / (fan_in + fan_out))
+        initializer = tensorflow.random_uniform_initializer(-init_range, init_range)
+        var = tensorflow.get_variable('w', shape=shape, dtype=tensorflow.float32, initializer=initializer)
+        weight_decay = tensorflow.mul(tensorflow.nn.l2_loss(var), wd, name='weight_loss')
+        tensorflow.add_to_collection('losses', weight_decay)
+        kernel = var
+        conv = tensorflow.nn.conv2d(input_op, kernel, (1, dh, dw, 1), padding=padding)
+        bias_init_val = tensorflow.constant(0.0, shape=[n_out], dtype=tensorflow.float32)
+        biases = tensorflow.get_variable(initializer=bias_init_val, trainable=True, name='b')
+        z = tensorflow.nn.bias_add(conv, biases)
+        if activation:
+            z = tensorflow.nn.relu(z, name='Activation')
+        return z
+
+
+def conv_op_bn(input_op, name, kw, kh, n_out, dw, dh, wd, padding, train_phase):
+    n_in = input_op.get_shape()[-1].value
+    shape = [kh, kw, n_in, n_out]
+    scope_bn = name + '_bn'
+    with tensorflow.variable_scope(name):
+        receptive_field_size = numpy.prod(shape[:-2])
+        fan_in = shape[-2] * receptive_field_size
+        fan_out = shape[-1] * receptive_field_size
+        init_range = numpy.sqrt(6.0 / (fan_in + fan_out))
+        initializer = tensorflow.random_uniform_initializer(-init_range, init_range)
+        var = tensorflow.get_variable('w', shape=shape, dtype=tensorflow.float32, initializer=initializer)
+        weight_decay = tensorflow.mul(tensorflow.nn.l2_loss(var), wd, name='weigh_loss')
+        tensorflow.add_to_collection('losses', weight_decay)
+        kernel = var
+        conv = tensorflow.nn.conv2d(input_op, kernel, (1, dh, dw, 1), padding=padding)
+        bias_init_val = tensorflow.constant(0.0, shape=[n_out], dtype=tensorflow.float32)
+        biases = tensorflow.get_variable(initializer=bias_init_val, trainable=True, name='b')
+        out_conv = tensorflow.nn.bias_add(conv, biases)
+        z = tensorflow.layers.batch_normalization(out_conv, scale=False, center=False)
+        return z
+
+
+def deconv_op(input_op, name, kw, kh, n_out, wd, batchsize, activation=True):
+    n_in = input_op.get_shape()[-1].value
+    shape = [kh, kw, n_out, n_in]
+    hin = input_op.get_shape()[1].value
+    win = input_op.get_shape()[2].value
+    output_shape = [batchsize, 2 * hin, 2 * win, n_out]
+    with tensorflow.variable_scope(name):
+        receptive_field_size = numpy.prod(shape[:-2])
+        fan_in = shape[-2] * receptive_field_size
+        fan_out = shape[-1] * receptive_field_size
+        init_range = numpy.sqrt(6.0 / (fan_in + fan_out))
+        initializer = tensorflow.random_uniform_initializer(-init_range, init_range)
+        var = tensorflow.get_variable('w', shape=shape, dtype=tensorflow.float32, initializer=initializer)
+        kernel = var
+        deconv = tensorflow.nn.conv2d_transpose(input_op, kernel, output_shape, strides=[1, 2, 2, 1], padding='SAME')
+        bias_init_val = tensorflow.constant(0.0, shape=[n_out], dtype=tensorflow.float32)
+        biases = tensorflow.get_variable(initializer=bias_init_val, trainable=True, name='b')
+        z = tensorflow.nn.bias_add(deconv, biases)
+        if activation:
+            z = tensorflow.nn.relu(z, name='Activation')
+        return z
+
+
+def fully_connected_op(input_op, name, n_out, wd, activation=True):
+    im_shape = input_op.get_shape().as_list()
+    n_inputs = int(numpy.prod(im_shape[1:]))
+    shape = [n_inputs, n_out]
+    with tensorflow.variable_scope(name):
+        receptive_field_size = numpy.prod(shape[:-2])
+        fan_in = shape[-2] * receptive_field_size
+        fan_out = shape[-1] * receptive_field_size
+        init_range = numpy.sqrt(6.0 / (fan_in + fan_out))
+        initializer = tensorflow.random_uniform_initializer(-init_range, init_range)
+        w = tensorflow.get_variable('w', shape=shape, dtype=tensorflow.float32, initializer=initializer)
+        bias_init_val = tensorflow.constant(0.0, shape=[n_out], dtype=tensorflow.float32)
+        biases = tensorflow.get_variable(initializer=bias_init_val, trainable=True, name='b')
+        if len(im_shape) > 2:
+            x = tensorflow.reshape(input_op, [-1, n_inputs])
+        else:
+            x = input_op
+        z = tensorflow.matmul(x, w) + biases
+        if activation:
+            z = tensorflow.nn.relu(z)
+        return z
+
+
 def loss_dice(logits, labels, num_classes, batch_size_tf):
     with tensorflow.name_scope('loss'):
         probs = tensorflow.nn.softmax(logits)
@@ -101,4 +193,40 @@ class seg_GAN(object):
         self.saver = tensorflow.train.Saver(max_to_keep=50000)
 
     def generator(self, input_op, batch_size_tf):
-        conv1_1 = c
+        conv1_1 = conv_op(input_op, name='g_conv1_1', kh=7, kw=7, n_out=32, dh=1, dw=1, wd=self.wd)
+        conv1_2 = conv_op(conv1_1, name='g_conv1_2', kh=7, kw=7, n_out=32, dh=1, dw=1, wd=self.wd)
+        pool1 = tensorflow.nn.max_pool(conv1_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME', name='g_pool1')
+        conv2_1 = conv_op(pool1, name='g_conv2_1', kh=7, kw=7, n_out=64, dh=1, dw=1, wd=self.wd)
+        conv2_2 = conv_op(conv2_1, name='g_conv2_2', kh=7, kw=7, n_out=64, dh=1, dw=1, wd=self.wd)
+        pool2 = tensorflow.nn.max_pool(conv2_2, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME', name='g_pool2')
+        conv3_1 = conv_op(pool2, name='g_conv3_1', kh=7, kw=7, n_out=96, dh=1, dw=1, wd=self.wd)
+        conv3_2 = conv_op(conv3_1, name='g_conv3_2', kh=7, kw=7, n_out=96, dh=1, dw=1, wd=self.wd)
+        pool3 = tensorflow.nn.max_pool(conv3_2, ksize=[1, 2 ,2 ,1], strides=[1, 2, 2, 1], padding='SAME', name='g_pool3')
+        conv4_1 = conv_op(pool3, name='g_conv4_1', kh=7, kw=7, n_out=128, dh=1, dw=1, wd=self.wd)
+        conv4_2 = conv_op(conv4_1, name='g_conv4_2', kh=7, kw=7, n_out=128, dh=1, dw=1, wd=self.wd)
+        deconv1 = deconv_op(conv4_2, name='g_deconv1', kh=4, kw=4, n_out=64, wd=self.wd, batchsize=batch_size_tf)
+        concat1 = tensorflow.concat(3, [deconv1, conv3_2], name='g_concat1')
+        deconv2 = deconv_op(concat1, name='g_deconv2', kh=4, kw=4, n_out=64, wd=self.wd, batchsize=batch_size_tf)
+        concat2 = tensorflow.concat(3, [deconv2, conv2_2], name='g_concat2')
+        deconv3 = deconv_op(concat2, name='g_deconv3', kh=4, kw=4, n_out=32, wd=self.wd, batchsize=batch_size_tf)
+        concat3 = tensorflow.concat(3, [deconv3, conv1_2], name='g_concat3')
+        upsocre = conv_op(concat3, name='g_upscore', kh=7, kw=7, n_out=self.num_classes, dh=1, dw=1, wd=self.wd, activation=False)
+        return upsocre, upsocre
+
+    def discriminator(self, inputCT, reuse=False):
+        if reuse:
+            tensorflow.get_variable_scope().reuse_variables()
+        print('ct_shape', inputCT.get_shape())
+        h0 = conv_op_bn(inputCT, name='d_conv_dis_1_a', kh=5, kw=5, n_out=32, dh=1, dw=1, wd=self.wd, padding='VALID', train_phase=self.train_phase)
+        m0 = tensorflow.nn.max_pool(h0, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], name='pool0')
+        h1 = conv_op_bn(m0, name='d_conv2_dis_a', kh=5, kw=5, n_out=64, dh=1, dw=1, wd=self.wd, padding='VALID', train_phase=self.train_phase)
+        m1 = tensorflow.nn.max_pool(h1, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], name='pool1')
+        h2 = conv_op_bn(m1, name='d_conv3_dis_a', kh=5, kw=5, n_out=128, dh=1, dw=1, wd=self.wd, padding='VALID', train_phase=self.train_phase)
+        h3 = conv_op_bn(h2, name='d_conv4_dis_a', kh=5, kw=5, n_out=64, dh=1, dw=1, wd=self.wd, padding='VALID', train_phase=self.train_phase)
+        fc1 = fully_connected_op(h3, name='d_fc1', n_out=64, wd=self.wd, activation=True)
+        fc2 = fully_connected_op(fc1, name='d_fc2', n_out=32, wd=self.wd, activation=True)
+        fc3 = fully_connected_op(fc2, name='d_fc3', n_out=1, wd=self.wd, activation=False)
+        return tensorflow.nn.sigmoid(fc3), fc3
+
+    def train(self, config):
+        pass
